@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** Chatrin Yoonchalard
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6631304721
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** B. Canteen kiosk
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,26 +58,45 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
-
+| 1 | Availability / durability | 100% of reviews are accepted and none are lost, including during Wi-Fi outages of several minutes (the kiosk stores reviews locally until it can upload them). |
+| 2 | Accuracy | At least 90% of labels are correct (same as QR3), so the small model alone (72.5%) is not enough. |
+| 3 | Timeliness and cost | Every review is labelled by the end of the day (e.g. 23:59), using as few large-model calls as possible and never more than 20 calls/s. |
 ## 2. Design / การออกแบบ
 
 Your topology, the patterns you add, and a container-level diagram (C4 level 2). The C4 diagram must be written in Mermaid.
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
+**Topology:** T4 Asynchronous / batch. **Patterns:** cascade (threshold 0.7) + cache inside the batch job, and fallback (timeout -> leave as `pending`, retry in the next batch).
+
+The kiosk saves every review in a local outbox first, so it works offline. When Wi-Fi returns, it uploads the outbox. The review service stores each review as `pending` and puts it on a queue. A batch labeller runs every hour (and once more before end of day) and labels pending reviews through the inference service, rate-limited below 20 large calls/s.
+
+Threshold 0.7 here instead of the 0.6 chosen in Q2.1: 0.6 was chosen for real-time latency, but in a batch job latency does not matter, so the extra accuracy (93.0% vs 91.5%, t2-0.7 vs t2-0.6) is worth it.
+
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
-    Person(customer, "Customer", "Writes restaurant reviews")
+    title Scenario B (canteen kiosk): container diagram
+    Person(student, "Student", "Leaves a review on the canteen tablet")
+    Person(owner, "Restaurant owner", "Reads labelled reviews at the end of the day")
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container(kiosk, "Kiosk app", "Tablet app, local SQLite outbox", "Saves every review locally first, uploads when online")
+        Container(gateway, "API gateway", "Python, FastAPI", "Single entry point")
+        Container(review, "Review service", "Python, FastAPI", "Stores reviews as pending, serves label counts")
+        ContainerDb(db, "Review store", "Database", "Reviews and their labels / status")
+        ContainerQueue(queue, "Review queue", "Message broker", "Pending reviews waiting to be labelled")
+        Container(batch, "Batch labeller", "Python worker, hourly + end of day", "Takes pending reviews, rate-limits to < 20 large calls/s, retries failures next run")
+        Container(inference, "Inference service", "Python, FastAPI, scikit-learn", "Cascade (small then large, threshold 0.7) with prediction cache")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    Rel(student, kiosk, "Writes review")
+    Rel(kiosk, gateway, "Uploads outbox when online", "HTTP/JSON")
+    Rel(gateway, review, "Forwards reviews")
+    Rel(review, db, "Saves review as pending")
+    Rel(review, queue, "Publishes review id")
+    Rel(batch, queue, "Consumes pending reviews")
+    Rel(batch, inference, "POST /predict", "REST")
+    Rel(batch, db, "Writes label / keeps pending on timeout")
+    Rel(owner, gateway, "Views label counts", "HTTP/JSON")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +107,13 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t0-small | Small model alone: 72.5% accuracy. Running only the small model on the kiosk (T2) fails the 90% accuracy requirement. |
+| t0-large | Large model for everything: 93.5% accuracy but 100% large calls, the most expensive option. |
+| t2-0.7 | Cascade at 0.7: 93.0% accuracy with only 53% large calls. Its p95 (587 ms) doesn't matter here, because labels are only needed by end of day. |
+| t3-cache | Cascade 0.7 + cache: 93.0% accuracy, large calls down to 38%, 35% cache hits. Repeated short kiosk reviews ("อร่อย", "Too salty") are cheap. |
+| t1-after | Fallback turns 10% hangs into 28 pending reviews and 0 errors. In batch, pending reviews are simply retried in the next run, so nothing is lost. |
+
+Capacity: even if the whole campus sends 5,000 kiosk reviews in a day, 38% large calls = 1,900 calls. At the 20 calls/s limit that is about 95 s of large-model time per day, so hourly batches finish easily before end of day.
 
 ## 4. ADR
 
@@ -97,20 +121,22 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** Label canteen kiosk reviews with an asynchronous batch job (T4) using cascade + cache
 
 **Status:** Proposed
 
-**Context:**
+**Context:** Canteen tablets lose Wi-Fi several times a day for minutes at a time, but every review must be accepted and owners need labels only by the end of the day. Labels must be at least 90% correct, and the large model is limited to 20 calls/s and costs money per call. The small model alone reaches only 72.5% (t0-small).
 
-**Decision:**
+**Decision:** The kiosk writes every review to a local outbox and uploads it when online. The review service stores it as `pending` and queues it. A batch labeller runs hourly and before end of day, calling the inference service with cascade (threshold 0.7) and the prediction cache, rate-limited below 20 large calls/s. Calls that time out stay `pending` and are retried in the next run (fallback).
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: No review is lost during Wi-Fi outages; accuracy about 93% (t2-0.7, t3-cache); only about 38% of reviews reach the large model (t3-cache), so cost is low; large-model capacity is never exceeded because the batch controls its own rate; a slow or hung large model only delays labels, it never blocks a student.
+- Negative: Labels arrive up to an hour late, so owners cannot react in real time; more moving parts (kiosk outbox, broker, batch worker) to build and monitor; the kiosk needs local storage and duplicate-safe uploads (idempotent review ids) in case an upload is retried.
 
 **Alternatives considered:** at least one topology you rejected, and why.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
 
->
+> **T1 (synchronous model as a service):** rejected, because every review needs the network at the moment it is written, so reviews are lost or rejected while the tablet is offline, and it pays real-time cost for labels nobody needs until evening.
+> **T2 (small model on the kiosk only):** rejected, because it works offline but gives only 72.5% accuracy, below the 90% requirement.
+> **T3 (hybrid: small model on kiosk, large remote):** rejected for now. It could show a label instantly, but owners don't need that, and the hard reviews still need the network, so the kiosk would still need an outbox and a batch path, adding complexity without meeting any extra requirement.
